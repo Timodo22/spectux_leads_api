@@ -6,7 +6,7 @@ compatibility_date = "2024-03-04"
 [[d1_databases]]
 binding = "DB"
 database_name = "spectux_leads"
-database_id = "VUL_HIER_JOUW_DATABASE_ID_IN"
+database_id = "2bba9743-af90-4e32-bf96-b170f3c65475"
 # (Optioneel voor lokaal testen)
 # preview_database_id = "DB" 
 
