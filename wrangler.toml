@@ -11,8 +11,6 @@ database_id = "2bba9743-af90-4e32-bf96-b170f3c65475"
 # preview_database_id = "DB" 
 
 # 2. Publieke variabelen (Veilig om hier in te vullen)
-[vars]
-TELEGRAM_CHAT_ID = "JOUW_CHAT_ID"
 
 # LET OP: Zet NOOIT je API keys (Gemini, Telegram Bot, Admin Secret) hardcoded in deze file!
 # Die voegen we in Stap 4 toe via de terminal als 'Secrets'.
