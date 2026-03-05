@@ -7,10 +7,6 @@ compatibility_date = "2024-03-04"
 binding = "DB"
 database_name = "sp_leads"
 database_id = "5c0ac500-9529-44c9-b951-63125f1825c9"
-# (Optioneel voor lokaal testen)
-# preview_database_id = "DB" 
 
-# 2. Publieke variabelen (Veilig om hier in te vullen)
-
-# LET OP: Zet NOOIT je API keys (Gemini, Telegram Bot, Admin Secret) hardcoded in deze file!
-# Die voegen we in Stap 4 toe via de terminal als 'Secrets'.
+[triggers]
+crons = ["0 3 * * *"]
