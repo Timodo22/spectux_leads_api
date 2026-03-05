@@ -1,52 +1,174 @@
-// ============================================================
-// Spectux Lead Pipeline — Cloudflare Worker (index.js)
+// =============================================================================
+// Spectux Leads Worker — index.js  (v2)
 //
 // Routes:
-//   POST /lead/places          — Eindhoven/regio bel-leads (Stroom 1)
-//   POST /lead/instagram       — Instagram DM-leads (Stroom 2)
-//   POST /telegram-webhook     — Telegram callback knop verwerking
-//   GET  /health               — sanity check
+//   POST /lead/instagram      — Nieuwe Instagram lead opslaan + Telegram sturen
+//   POST /lead/places         — Bestaande bel-lead flow
+//   POST /lead/instagram/dm   — Update: DM verstuurd (vanuit lokale bot)
+//   POST /telegram-webhook    — Telegram callback-knoppen verwerken
+//   GET  /leads               — Alle leads ophalen (voor lokaal dashboard)
+//   GET  /health              — Statuscheck
 //
-// Scheduled (Cron):
-//   Dagelijks: verwijder leads ouder dan 30 dagen
-// ============================================================
+// Telegram knoppen per Instagram lead:
+//   ✅ Gecontacteerd    → status = contacted
+//   ❌ Niet interessant → status = skipped
+//   🔁 Opnieuw DM'en   → zet terug op queued
+// =============================================================================
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const authHeader = request.headers.get("X-API-Secret");
+    const url    = new URL(request.url);
+    const secret = request.headers.get("X-API-Secret");
 
-    // Telegram webhook heeft geen secret header — beveiligd via Telegram zelf
+    // Telegram webhook: geen secret nodig (beveiligd via Telegram zelf)
     if (url.pathname === "/telegram-webhook") {
       return handleTelegramWebhook(request, env);
     }
 
-    if (authHeader !== env.WORKER_SECRET) {
+    // Alle andere routes vereisen de secret header
+    if (secret !== env.WORKER_SECRET) {
       return json({ error: "Unauthorized" }, 401);
     }
 
-    if (request.method === "GET" && url.pathname === "/health") {
-      return json({ status: "ok", service: "spectux-leads" });
-    }
-    if (request.method === "POST" && url.pathname === "/lead/places") {
-      return handlePlacesLead(request, env);
-    }
-    if (request.method === "POST" && url.pathname === "/lead/instagram") {
+    // ── Routes ──────────────────────────────────────────────────────────────
+    if (request.method === "GET"  && url.pathname === "/health")
+      return json({ status: "ok", service: "spectux-leads-v2" });
+
+    if (request.method === "GET"  && url.pathname === "/leads")
+      return handleGetLeads(request, env);
+
+    if (request.method === "POST" && url.pathname === "/lead/instagram")
       return handleInstagramLead(request, env);
-    }
+
+    if (request.method === "POST" && url.pathname === "/lead/instagram/dm")
+      return handleInstagramDmSent(request, env);
+
+    if (request.method === "POST" && url.pathname === "/lead/places")
+      return handlePlacesLead(request, env);
 
     return json({ error: "Not found" }, 404);
   },
 
-  // Cron Trigger: dagelijkse cleanup (zie wrangler.toml)
+  // Dagelijkse cleanup van leads ouder dan 60 dagen
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runCleanup(env));
   },
 };
 
-// ─────────────────────────────────────────────
-// STROOM 1 — Bel-lead verwerken
-// ─────────────────────────────────────────────
+// =============================================================================
+// INSTAGRAM LEAD — Opslaan + Telegram notificatie
+// =============================================================================
+async function handleInstagramLead(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ error: "Invalid JSON" }, 400); }
+
+  const { username, bio, follower_count, website, email_in_bio,
+          source_hashtag, profile_url } = body;
+
+  if (!username) return json({ error: "username is verplicht" }, 400);
+
+  // ── Duplicate check ──────────────────────────────────────────────────────
+  const existing = await env.DB.prepare(
+    "SELECT id, status FROM instagram_leads WHERE username = ?"
+  ).bind(username).first();
+
+  if (existing) {
+    return json({ status: "duplicate", lead_id: existing.id, current_status: existing.status });
+  }
+
+  // ── Genereer DM tekst via Gemini ─────────────────────────────────────────
+  const dmText = await generateInstagramDm(
+    env.GEMINI_API_KEY, username, bio ?? "", email_in_bio ?? "", follower_count ?? 0
+  );
+
+  // ── Opslaan in D1 ────────────────────────────────────────────────────────
+  const result = await env.DB.prepare(`
+    INSERT INTO instagram_leads
+      (username, bio, follower_count, website, email_in_bio, source_hashtag, profile_url, dm_text, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued')
+  `).bind(
+    username, bio ?? null, follower_count ?? null, website ?? null,
+    email_in_bio ?? null, source_hashtag ?? null, profile_url ?? null, dmText
+  ).run();
+
+  const leadId = result.meta.last_row_id;
+
+  // ── Telegram bericht met 3 knoppen ───────────────────────────────────────
+  const message = buildInstagramMessage(
+    username, bio, follower_count, email_in_bio, source_hashtag, dmText
+  );
+
+  const telegramRes = await sendTelegramWithButtons(
+    env.TELEGRAM_BOT_TOKEN,
+    env.TELEGRAM_CHAT_ID,
+    message,
+    [
+      // Rij 1: hoofd-acties
+      [
+        { text: "✅ Gecontacteerd",     callback_data: `ig_contacted_${leadId}` },
+        { text: "❌ Niet interessant",  callback_data: `ig_skip_${leadId}` },
+      ],
+      // Rij 2: extra
+      [
+        { text: "🔁 Opnieuw DM'en",    callback_data: `ig_retry_${leadId}` },
+        { text: "👤 Profiel bekijken", url: `https://instagram.com/${username}` },
+      ],
+    ]
+  );
+
+  // Sla Telegram message_id op (voor latere knop-updates)
+  if (telegramRes?.result?.message_id) {
+    await env.DB.prepare(
+      "UPDATE instagram_leads SET telegram_msg_id = ? WHERE id = ?"
+    ).bind(telegramRes.result.message_id, leadId).run();
+  }
+
+  return json({ status: "ok", lead_id: leadId, dm_text: dmText });
+}
+
+// =============================================================================
+// INSTAGRAM DM VERZONDEN — Status update vanuit lokale bot
+// =============================================================================
+async function handleInstagramDmSent(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ error: "Invalid JSON" }, 400); }
+
+  const { username, dm_text } = body;
+  if (!username) return json({ error: "username is verplicht" }, 400);
+
+  await env.DB.prepare(`
+    UPDATE instagram_leads
+    SET status = 'dm_sent',
+        dm_text = COALESCE(?, dm_text),
+        dm_sent_at = datetime('now'),
+        dm_count = dm_count + 1,
+        updated_at = datetime('now')
+    WHERE username = ?
+  `).bind(dm_text ?? null, username).run();
+
+  // Update de Telegram knop tekst
+  const lead = await env.DB.prepare(
+    "SELECT telegram_msg_id FROM instagram_leads WHERE username = ?"
+  ).bind(username).first();
+
+  if (lead?.telegram_msg_id) {
+    // Voeg "📤 DM verstuurd" toe aan de knoppen
+    await updateTelegramCaption(
+      env.TELEGRAM_BOT_TOKEN,
+      env.TELEGRAM_CHAT_ID,
+      lead.telegram_msg_id,
+      `📤 DM verstuurd naar @${escapeMd(username)}\\.`
+    );
+  }
+
+  return json({ status: "ok" });
+}
+
+// =============================================================================
+// GOOGLE MAPS BEL-LEAD (bestaande flow, nu met D1)
+// =============================================================================
 async function handlePlacesLead(request, env) {
   let body;
   try { body = await request.json(); }
@@ -60,14 +182,14 @@ async function handlePlacesLead(request, env) {
   ).bind(websiteUrl).first();
   if (existing) return json({ status: "duplicate" });
 
-  const geminiPitch = await generatePlacesPitch(
+  const pitch = await generatePlacesPitch(
     env.GEMINI_API_KEY, name, websiteUrl, pagespeed_score, city
   );
 
-  const result = await env.DB.prepare(
-    `INSERT INTO places_leads (name, url, phone, pagespeed_score, city, gemini_pitch)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).bind(name, websiteUrl, phone ?? null, pagespeed_score ?? null, city ?? null, geminiPitch).run();
+  const result = await env.DB.prepare(`
+    INSERT INTO places_leads (name, url, phone, pagespeed_score, city, gemini_pitch)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(name, websiteUrl, phone ?? null, pagespeed_score ?? null, city ?? null, pitch).run();
 
   const leadId = result.meta.last_row_id;
 
@@ -80,67 +202,60 @@ async function handlePlacesLead(request, env) {
     `📱 *Telefoon:* ${escapeMd(phone ?? "onbekend")}\n` +
     `⚡ *PageSpeed:* ${pagespeed_score ?? "??"}/100\n` +
     `━━━━━━━━━━━━━━━━━━\n` +
-    `💬 *Openingszin:*\n_${escapeMd(geminiPitch)}_`;
+    `💬 *Openingszin:*\n_${escapeMd(pitch)}_`;
 
-  await sendTelegramWithButton(
-    env.TELEGRAM_BOT_TOKEN,
-    env.TELEGRAM_CHAT_ID,
-    message,
-    `done_places_${leadId}`,
-    "✅ Gebeld — verwijder lead"
+  const tgRes = await sendTelegramWithButtons(
+    env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, message,
+    [
+      [
+        { text: "✅ Gebeld — succes!",    callback_data: `pl_contacted_${leadId}` },
+        { text: "❌ Niet interessant",    callback_data: `pl_skip_${leadId}` },
+      ],
+      [
+        { text: "🔁 Terugbellen",        callback_data: `pl_retry_${leadId}` },
+        { text: "🌐 Website bekijken",   url: websiteUrl },
+      ],
+    ]
   );
 
-  return json({ status: "ok", lead_id: leadId, gemini_pitch: geminiPitch });
+  if (tgRes?.result?.message_id) {
+    await env.DB.prepare(
+      "UPDATE places_leads SET telegram_msg_id = ? WHERE id = ?"
+    ).bind(tgRes.result.message_id, leadId).run();
+  }
+
+  return json({ status: "ok", lead_id: leadId, gemini_pitch: pitch });
 }
 
-// ─────────────────────────────────────────────
-// STROOM 2 — Instagram lead verwerken
-// ─────────────────────────────────────────────
-async function handleInstagramLead(request, env) {
-  let body;
-  try { body = await request.json(); }
-  catch { return json({ error: "Invalid JSON" }, 400); }
+// =============================================================================
+// LEADS OPHALEN — voor lokaal dashboard
+// =============================================================================
+async function handleGetLeads(request, env) {
+  const url    = new URL(request.url);
+  const type   = url.searchParams.get("type")   ?? "instagram";
+  const status = url.searchParams.get("status");
+  const limit  = parseInt(url.searchParams.get("limit") ?? "200");
 
-  const { username, bio, follower_count } = body;
-  if (!username) return json({ error: "username is verplicht" }, 400);
+  const table = type === "places" ? "places_leads" : "instagram_leads";
 
-  const existing = await env.DB.prepare(
-    "SELECT id FROM instagram_leads WHERE username = ?"
-  ).bind(username).first();
-  if (existing) return json({ status: "duplicate" });
+  let query = `SELECT * FROM ${table}`;
+  const binds = [];
 
-  const geminiDm = await generateInstagramDm(env.GEMINI_API_KEY, username, bio ?? "");
+  if (status && status !== "all") {
+    query += " WHERE status = ?";
+    binds.push(status);
+  }
 
-  const result = await env.DB.prepare(
-    `INSERT INTO instagram_leads (username, bio, follower_count, gemini_dm)
-     VALUES (?, ?, ?, ?)`
-  ).bind(username, bio ?? null, follower_count ?? null, geminiDm).run();
+  query += " ORDER BY created_at DESC LIMIT ?";
+  binds.push(limit);
 
-  const leadId = result.meta.last_row_id;
-
-  const message =
-    `📱 *NIEUWE INSTA\\-LEAD*\n` +
-    `━━━━━━━━━━━━━━━━━━\n` +
-    `👤 *Username:* @${escapeMd(username)}\n` +
-    `👥 *Volgers:* ${follower_count ?? "??"}\n` +
-    `📝 *Bio:* _${escapeMd(bio ?? "(leeg)")}_\n` +
-    `━━━━━━━━━━━━━━━━━━\n` +
-    `💬 *DM tekst:*\n_${escapeMd(geminiDm)}_`;
-
-  await sendTelegramWithButton(
-    env.TELEGRAM_BOT_TOKEN,
-    env.TELEGRAM_CHAT_ID,
-    message,
-    `done_instagram_${leadId}`,
-    "✅ Gebericht — verwijder lead"
-  );
-
-  return json({ status: "ok", lead_id: leadId, gemini_dm: geminiDm });
+  const { results } = await env.DB.prepare(query).bind(...binds).all();
+  return json({ leads: results, count: results.length });
 }
 
-// ─────────────────────────────────────────────
-// TELEGRAM WEBHOOK — knop callback verwerking
-// ─────────────────────────────────────────────
+// =============================================================================
+// TELEGRAM WEBHOOK — Knoppen verwerken
+// =============================================================================
 async function handleTelegramWebhook(request, env) {
   let body;
   try { body = await request.json(); }
@@ -152,144 +267,165 @@ async function handleTelegramWebhook(request, env) {
   const callbackId   = query.id;
   const chatId       = query.message?.chat?.id;
   const messageId    = query.message?.message_id;
-  const callbackData = query.data ?? "";
+  const data         = query.data ?? "";
+  const clickedBy    = query.from?.first_name ?? "Iemand";
 
-  // Formaat: done_places_123 of done_instagram_456
-  const match = callbackData.match(/^done_(places|instagram)_(\d+)$/);
+  // ── Parse callback data ──────────────────────────────────────────────────
+  // Formaat: ig_contacted_123 / ig_skip_123 / ig_retry_123
+  //          pl_contacted_123 / pl_skip_123 / pl_retry_123
+  const match = data.match(/^(ig|pl)_(contacted|skip|retry)_(\d+)$/);
 
   if (!match) {
-    await answerCallback(env.TELEGRAM_BOT_TOKEN, callbackId, "Onbekende actie");
+    await answerCallback(env.TELEGRAM_BOT_TOKEN, callbackId, "⚠️ Onbekende actie");
     return new Response("ok");
   }
 
-  const type   = match[1];
-  const leadId = parseInt(match[2]);
-  const table  = type === "places" ? "places_leads" : "instagram_leads";
+  const prefix = match[1]; // ig of pl
+  const action = match[2]; // contacted, skip, retry
+  const leadId = parseInt(match[3]);
+  const table  = prefix === "ig" ? "instagram_leads" : "places_leads";
 
-  try {
-    const existing = await env.DB.prepare(
-      `SELECT id FROM ${table} WHERE id = ?`
-    ).bind(leadId).first();
+  // ── Controleer of lead bestaat ───────────────────────────────────────────
+  const lead = await env.DB.prepare(
+    `SELECT * FROM ${table} WHERE id = ?`
+  ).bind(leadId).first();
 
-    if (!existing) {
-      await answerCallback(env.TELEGRAM_BOT_TOKEN, callbackId, "⚠️ Lead was al verwijderd");
-      await editTelegramReplyMarkup(env.TELEGRAM_BOT_TOKEN, chatId, messageId);
-      return new Response("ok");
-    }
-
-    // Lead verwijderen
-    await env.DB.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(leadId).run();
-
-    // Popup bevestiging
-    const successMsg = type === "places"
-      ? "🗑 Lead verwijderd — succes met bellen!"
-      : "🗑 Lead verwijderd — succes met DM'en!";
-    await answerCallback(env.TELEGRAM_BOT_TOKEN, callbackId, successMsg);
-
-    // Verwijder de knop uit het bericht + stuur reply
-    await editTelegramReplyMarkup(env.TELEGRAM_BOT_TOKEN, chatId, messageId);
-
-    const timestamp = new Date().toLocaleString("nl-NL", { timeZone: "Europe/Amsterdam" });
-    await sendTelegramReply(
-      env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-      `✅ *Afgehandeld* op ${escapeMd(timestamp)}\\.`
-    );
-
-  } catch (err) {
-    console.error("Webhook fout:", err);
-    await answerCallback(env.TELEGRAM_BOT_TOKEN, callbackId, "❌ Fout bij verwijderen");
+  if (!lead) {
+    await answerCallback(env.TELEGRAM_BOT_TOKEN, callbackId, "⚠️ Lead niet gevonden");
+    await removeTelegramButtons(env.TELEGRAM_BOT_TOKEN, chatId, messageId);
+    return new Response("ok");
   }
+
+  // ── Actie uitvoeren ──────────────────────────────────────────────────────
+  const actionMap = {
+    contacted: { status: "contacted", emoji: "✅", msg: "Gemarkeerd als gecontacteerd!" },
+    skip:      { status: "skipped",   emoji: "❌", msg: "Lead overgeslagen." },
+    retry:     { status: "queued",    emoji: "🔁", msg: "Terug in wachtrij gezet!" },
+  };
+
+  const { status: newStatus, emoji, msg } = actionMap[action];
+
+  await env.DB.prepare(`
+    UPDATE ${table}
+    SET status = ?, updated_at = datetime('now')
+    WHERE id = ?
+  `).bind(newStatus, leadId).run();
+
+  // Log de actie
+  await env.DB.prepare(`
+    INSERT INTO telegram_actions (lead_type, lead_id, action)
+    VALUES (?, ?, ?)
+  `).bind(prefix, leadId, action).run();
+
+  // ── Telegram feedback ────────────────────────────────────────────────────
+  await answerCallback(env.TELEGRAM_BOT_TOKEN, callbackId, msg);
+
+  // Verwijder de knoppen + voeg timestamp toe
+  await removeTelegramButtons(env.TELEGRAM_BOT_TOKEN, chatId, messageId);
+
+  const ts = new Date().toLocaleString("nl-NL", { timeZone: "Europe/Amsterdam" });
+  const identifier = prefix === "ig"
+    ? `@${escapeMd(lead.username)}`
+    : escapeMd(lead.name ?? "lead");
+
+  await sendTelegramReply(
+    env.TELEGRAM_BOT_TOKEN, chatId, messageId,
+    `${emoji} *${escapeMd(msg)}*\n` +
+    `👤 ${identifier}\n` +
+    `🕐 ${escapeMd(ts)}\n` +
+    `👆 Door: ${escapeMd(clickedBy)}`
+  );
 
   return new Response("ok");
 }
 
-// ─────────────────────────────────────────────
-// CRON: verwijder leads ouder dan 30 dagen
-// ─────────────────────────────────────────────
+// =============================================================================
+// CLEANUP — leads ouder dan 60 dagen
+// =============================================================================
 async function runCleanup(env) {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - 30);
-  const cutoffStr = cutoff.toISOString();
-
   const r1 = await env.DB.prepare(
-    "DELETE FROM places_leads WHERE created_at < ?"
-  ).bind(cutoffStr).run();
-
+    "DELETE FROM instagram_leads WHERE created_at < datetime('now', '-60 days')"
+  ).run();
   const r2 = await env.DB.prepare(
-    "DELETE FROM instagram_leads WHERE created_at < ?"
-  ).bind(cutoffStr).run();
+    "DELETE FROM places_leads WHERE created_at < datetime('now', '-60 days')"
+  ).run();
 
-  const deleted1 = r1.meta.changes ?? 0;
-  const deleted2 = r2.meta.changes ?? 0;
-
-  console.log(`Cleanup: ${deleted1} bel-leads + ${deleted2} insta-leads verwijderd`);
-
-  if ((deleted1 + deleted2) > 0) {
-    const msg =
-      `🧹 *Auto\\-cleanup*\n` +
-      `${deleted1} bel\\-leads en ${deleted2} insta\\-leads ouder dan 30 dagen verwijderd\\.`;
-    await sendTelegram(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, msg);
+  const total = (r1.meta.changes ?? 0) + (r2.meta.changes ?? 0);
+  if (total > 0) {
+    await sendTelegram(
+      env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID,
+      `🧹 *Auto\\-cleanup:* ${total} leads ouder dan 60 dagen verwijderd\\.`
+    );
   }
 }
 
-// ─────────────────────────────────────────────
-// Gemini
-// ─────────────────────────────────────────────
-async function generatePlacesPitch(apiKey, name, websiteUrl, score, city) {
+// =============================================================================
+// GEMINI helpers
+// =============================================================================
+async function generateInstagramDm(apiKey, username, bio, emailInBio, followers) {
+  const emailCtx = emailInBio
+    ? `Ze gebruiken nog ${emailInBio} als contactmail — niet professioneel.`
+    : "Ze hebben geen professionele website.";
+
   const prompt =
-    `Jij bent een vriendelijke Nederlandse verkoopmedewerker voor Spectux, een webdesign bureau. ` +
-    `Schrijf EEN korte, niet-technische openingszin (max 2 zinnen) voor een koud telefoongesprek ` +
-    `met het bedrijf "${name}" uit ${city ?? "de regio Eindhoven"} (website: ${websiteUrl}). ` +
-    `Hun mobiele PageSpeed score is ${score}/100, wat slecht is. ` +
-    `Leg in simpele taal uit wat dit betekent voor hun klanten. ` +
-    `Geen jargon. Menselijk en behulpzaam. Geef alleen de openingszin terug.`;
+    `Jij bent copywriter voor Spectux (spectux.com), een Nederlands webdesign bureau ` +
+    `voor startende ondernemers. Schrijf een ultra-korte Instagram DM (max 2-3 zinnen) ` +
+    `voor @${username}. ${emailCtx} Bio: "${bio.slice(0, 150)}". ` +
+    `${followers} volgers. Noem spectux.com op een heel natuurlijke manier. ` +
+    `Begin NIET met Hey/Hoi/Hi/Hallo. Klink menselijk. Geef alleen de DM tekst.`;
+
   return callGemini(apiKey, prompt);
 }
 
-async function generateInstagramDm(apiKey, username, bio) {
+async function generatePlacesPitch(apiKey, name, url, score, city) {
   const prompt =
-    `Jij bent een Nederlandse copywriter voor Spectux (spectux.com), een webdesign bureau ` +
-    `dat startende ondernemers helpt aan hun eerste professionele website. ` +
-    `Schrijf een super korte, informele Instagram DM (max 3 zinnen) voor @${username}. ` +
-    `Hun bio: "${bio}". Geen website. Noem spectux.com natuurlijk. ` +
-    `Begin niet met "Hey" of "Hoi". Klink menselijk. Geef alleen de DM tekst terug.`;
+    `Jij bent verkoopmedewerker voor Spectux (webdesign bureau). ` +
+    `Schrijf EEN openingszin (max 2 zinnen) voor een koud telefoongesprek ` +
+    `met "${name}" uit ${city ?? "Eindhoven"} (website: ${url}). ` +
+    `Hun PageSpeed score: ${score}/100 (slecht). Geen jargon. ` +
+    `Menselijk en behulpzaam. Geef alleen de openingszin.`;
   return callGemini(apiKey, prompt);
 }
 
 async function callGemini(apiKey, prompt) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 200, temperature: 0.8 },
-      }),
-    }
-  );
-  if (!res.ok) return "(kon geen tekst genereren)";
-  const data = await res.json();
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "(geen reactie)";
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 150, temperature: 0.85 },
+        }),
+      }
+    );
+    if (!res.ok) return "(kon geen tekst genereren)";
+    const data = await res.json();
+    return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "(geen reactie)";
+  } catch {
+    return "(Gemini onbereikbaar)";
+  }
 }
 
-// ─────────────────────────────────────────────
+// =============================================================================
 // Telegram helpers
-// ─────────────────────────────────────────────
-async function sendTelegramWithButton(token, chatId, text, callbackData, buttonLabel) {
-  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+// =============================================================================
+
+// Bericht met inline keyboard (array van arrays = rijen met knoppen)
+async function sendTelegramWithButtons(token, chatId, text, keyboard) {
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      chat_id: chatId,
+      chat_id:   chatId,
       text,
       parse_mode: "MarkdownV2",
       disable_web_page_preview: true,
-      reply_markup: {
-        inline_keyboard: [[{ text: buttonLabel, callback_data: callbackData }]]
-      }
+      reply_markup: { inline_keyboard: keyboard },
     }),
   });
+  return res.json();
 }
 
 async function sendTelegram(token, chatId, text) {
@@ -300,15 +436,13 @@ async function sendTelegram(token, chatId, text) {
   });
 }
 
-async function sendTelegramReply(token, chatId, replyToMessageId, text) {
+async function sendTelegramReply(token, chatId, replyToId, text) {
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "MarkdownV2",
-      reply_to_message_id: replyToMessageId,
+      chat_id: chatId, text, parse_mode: "MarkdownV2",
+      reply_to_message_id: replyToId,
     }),
   });
 }
@@ -317,21 +451,54 @@ async function answerCallback(token, callbackQueryId, text) {
   await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ callback_query_id: callbackQueryId, text, show_alert: true }),
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId,
+      text,
+      show_alert: true,
+    }),
   });
 }
 
-async function editTelegramReplyMarkup(token, chatId, messageId) {
+async function removeTelegramButtons(token, chatId, messageId) {
   await fetch(`https://api.telegram.org/bot${token}/editMessageReplyMarkup`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
+    body: JSON.stringify({
+      chat_id: chatId, message_id: messageId,
+      reply_markup: { inline_keyboard: [] },
+    }),
   });
 }
 
-// ─────────────────────────────────────────────
+async function updateTelegramCaption(token, chatId, messageId, appendText) {
+  // Stuur een reply met de update (eenvoudiger dan het bericht editen)
+  await sendTelegramReply(token, chatId, messageId, appendText);
+}
+
+// =============================================================================
+// Bericht builder
+// =============================================================================
+function buildInstagramMessage(username, bio, followers, emailInBio, hashtag, dmText) {
+  const emailLine = emailInBio
+    ? `📧 *Email in bio:* \`${escapeMd(emailInBio)}\`\n`
+    : `🌐 *Geen website gevonden*\n`;
+
+  return (
+    `📱 *NIEUWE INSTA\\-LEAD*\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `👤 *Account:* [@${escapeMd(username)}](https://instagram.com/${username})\n` +
+    `👥 *Volgers:* ${followers ?? "??"}\n` +
+    emailLine +
+    `🏷 *Hashtag:* \\#${escapeMd(hashtag ?? "onbekend")}\n` +
+    `📝 *Bio:*\n_${escapeMd((bio ?? "(leeg)").slice(0, 200))}_\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `💬 *Gegenereerde DM:*\n_${escapeMd(dmText)}_`
+  );
+}
+
+// =============================================================================
 // Utility
-// ─────────────────────────────────────────────
+// =============================================================================
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -340,5 +507,5 @@ function json(data, status = 200) {
 }
 
 function escapeMd(text) {
-  return String(text).replace(/([_*[\]()~`>#+=|{}.!\\-])/g, "\\$1");
+  return String(text ?? "").replace(/([_*[\]()~`>#+=|{}.!\\-])/g, "\\$1");
 }
