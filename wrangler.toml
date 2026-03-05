@@ -1,12 +1,19 @@
-name = "spectux-leads-api"
-main = "index.js" # Of waar je worker code precies staat
-compatibility_date = "2024-03-04"
+name = "spectux-leads"
+main = "index.js"
+compatibility_date = "2024-01-01"
 
-# 1. Jouw D1 Database koppeling (Plak hier de output van Stap 1)
+# D1 database koppeling
 [[d1_databases]]
-binding = "DB"
-database_name = "sp_leads"
-database_id = "5c0ac500-9529-44c9-b951-63125f1825c9"
+binding  = "DB"
+database_name = "spectux_leads"
+database_id   = "2e057ebd-89c5-4338-afb3-765a256a8d34"
 
+# Cron: dagelijkse cleanup om 03:00
 [triggers]
 crons = ["0 3 * * *"]
+
+# Environment variabelen (secrets via: npx wrangler secret put NAAM)
+# WORKER_SECRET
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_CHAT_ID
+# GEMINI_API_KEY
