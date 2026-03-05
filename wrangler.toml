@@ -5,8 +5,8 @@ compatibility_date = "2024-03-04"
 # 1. Jouw D1 Database koppeling (Plak hier de output van Stap 1)
 [[d1_databases]]
 binding = "DB"
-database_name = "spectux_leads"
-database_id = "2bba9743-af90-4e32-bf96-b170f3c65475"
+database_name = "sp_leads"
+database_id = "5c0ac500-9529-44c9-b951-63125f1825c9"
 # (Optioneel voor lokaal testen)
 # preview_database_id = "DB" 
 
